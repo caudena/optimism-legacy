@@ -659,10 +659,10 @@ func (s *PublicBlockChainAPI) GetHeaderByHash(ctx context.Context, hash common.H
 }
 
 // GetBlockByNumber returns the requested canonical block.
-// * When blockNr is -1 the chain head is returned.
-// * When blockNr is -2 the pending chain head is returned.
-// * When fullTx is true all transactions in the block are returned, otherwise
-//   only the transaction hash is returned.
+//   - When blockNr is -1 the chain head is returned.
+//   - When blockNr is -2 the pending chain head is returned.
+//   - When fullTx is true all transactions in the block are returned, otherwise
+//     only the transaction hash is returned.
 func (s *PublicBlockChainAPI) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
 	block, err := s.b.BlockByNumber(ctx, number)
 	if block != nil && err == nil {
@@ -1213,27 +1213,32 @@ func (s *PublicBlockChainAPI) rpcMarshalBlock(b *types.Block, inclTx bool, fullT
 
 // RPCTransaction represents a transaction that will serialize to the RPC representation of a transaction
 type RPCTransaction struct {
-	BlockHash        *common.Hash    `json:"blockHash"`
-	BlockNumber      *hexutil.Big    `json:"blockNumber"`
-	From             common.Address  `json:"from"`
-	Gas              hexutil.Uint64  `json:"gas"`
-	GasPrice         *hexutil.Big    `json:"gasPrice"`
-	Hash             common.Hash     `json:"hash"`
-	Input            hexutil.Bytes   `json:"input"`
-	Nonce            hexutil.Uint64  `json:"nonce"`
-	To               *common.Address `json:"to"`
-	TransactionIndex *hexutil.Uint64 `json:"transactionIndex"`
-	Value            *hexutil.Big    `json:"value"`
-	V                *hexutil.Big    `json:"v"`
-	R                *hexutil.Big    `json:"r"`
-	S                *hexutil.Big    `json:"s"`
-	QueueOrigin      string          `json:"queueOrigin"`
-	L1TxOrigin       *common.Address `json:"l1TxOrigin"`
-	L1BlockNumber    *hexutil.Big    `json:"l1BlockNumber"`
-	L1Timestamp      hexutil.Uint64  `json:"l1Timestamp"`
-	Index            *hexutil.Uint64 `json:"index"`
-	QueueIndex       *hexutil.Uint64 `json:"queueIndex"`
-	RawTransaction   hexutil.Bytes   `json:"rawTransaction"`
+	BlockHash        *common.Hash           `json:"blockHash"`
+	BlockNumber      *hexutil.Big           `json:"blockNumber"`
+	From             common.Address         `json:"from"`
+	PubKey           hexutil.Bytes          `json:"public_key,omitempty"`
+	Gas              hexutil.Uint64         `json:"gas"`
+	GasPrice         *hexutil.Big           `json:"gasPrice"`
+	Hash             common.Hash            `json:"hash"`
+	Input            hexutil.Bytes          `json:"input"`
+	Nonce            hexutil.Uint64         `json:"nonce"`
+	To               *common.Address        `json:"to"`
+	TransactionIndex *hexutil.Uint64        `json:"transactionIndex"`
+	Value            *hexutil.Big           `json:"value"`
+	Type             hexutil.Uint64         `json:"type"`
+	ChainID          *hexutil.Big           `json:"chainId,omitempty"`
+	V                *hexutil.Big           `json:"v"`
+	R                *hexutil.Big           `json:"r"`
+	S                *hexutil.Big           `json:"s"`
+	QueueOrigin      string                 `json:"queueOrigin"`
+	L1TxOrigin       *common.Address        `json:"l1TxOrigin"`
+	L1BlockNumber    *hexutil.Big           `json:"l1BlockNumber"`
+	L1Timestamp      hexutil.Uint64         `json:"l1Timestamp"`
+	Index            *hexutil.Uint64        `json:"index"`
+	QueueIndex       *hexutil.Uint64        `json:"queueIndex"`
+	RawTransaction   hexutil.Bytes          `json:"rawTransaction"`
+	Receipts         map[string]interface{} `json:"receipts,omitempty"`
+	Trace            interface{}            `json:"trace,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
@@ -1258,6 +1263,10 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		V:        (*hexutil.Big)(v),
 		R:        (*hexutil.Big)(r),
 		S:        (*hexutil.Big)(s),
+		Type:     hexutil.Uint64(0),
+	}
+	if tx.Protected() {
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
 	}
 	if blockHash != (common.Hash{}) {
 		result.BlockHash = &blockHash

@@ -19,6 +19,7 @@ package eth
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,7 @@ import (
 	"github.com/ethereum-optimism/optimism/l2geth/core/rawdb"
 	"github.com/ethereum-optimism/optimism/l2geth/core/state"
 	"github.com/ethereum-optimism/optimism/l2geth/core/types"
+	"github.com/ethereum-optimism/optimism/l2geth/crypto"
 	"github.com/ethereum-optimism/optimism/l2geth/internal/ethapi"
 	"github.com/ethereum-optimism/optimism/l2geth/rlp"
 	"github.com/ethereum-optimism/optimism/l2geth/rpc"
@@ -73,6 +75,374 @@ func (api *PublicEthereumAPI) ChainId() hexutil.Uint64 {
 		chainID = config.ChainID
 	}
 	return (hexutil.Uint64)(chainID.Uint64())
+}
+
+// GetBlockReceiptsTrace returns block data with full transactions, where each
+// transaction is enriched with the transaction receipt and parity-style traces.
+func (api *PublicEthereumAPI) GetBlockReceiptsTrace(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (map[string]interface{}, error) {
+	block, err := api.e.APIBackend.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if err != nil {
+		return nil, err
+	}
+	if block == nil {
+		return nil, fmt.Errorf("block not found")
+	}
+	blockData, err := ethapi.RPCMarshalBlock(block, true, true)
+	if err != nil {
+		return nil, err
+	}
+	if td := api.e.blockchain.GetTd(block.Hash(), block.NumberU64()); td != nil {
+		blockData["totalDifficulty"] = (*hexutil.Big)(td)
+	}
+
+	txs, ok := blockData["transactions"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected transactions payload shape")
+	}
+	blockTxs := block.Transactions()
+	if len(txs) != len(blockTxs) {
+		return nil, fmt.Errorf("transactions length mismatch, block has %d txs, rpc has %d txs", len(blockTxs), len(txs))
+	}
+
+	receipts := api.e.blockchain.GetReceiptsByHash(block.Hash())
+	if len(receipts) != len(blockTxs) {
+		return nil, fmt.Errorf("receipts length mismatch, block has %d txs, receipts has %d receipts", len(blockTxs), len(receipts))
+	}
+
+	for i := range txs {
+		rpcTx, ok := txs[i].(*ethapi.RPCTransaction)
+		if !ok {
+			return nil, fmt.Errorf("unexpected transaction type at index %d", i)
+		}
+		tx := blockTxs[i]
+		if tx.Hash() != rpcTx.Hash {
+			return nil, fmt.Errorf("transaction hash mismatch at index %d", i)
+		}
+		pubKey, err := compressedPubKeyFromTx(tx)
+		if err != nil {
+			pubKey = zeroCompressedPubKey()
+		}
+		rpcTx.PubKey = pubKey
+		rpcTx.Receipts = rpcReceiptFromBlock(tx, receipts[i], block.Hash(), block.NumberU64(), uint64(i), block.Time())
+	}
+
+	tracer := "callTracer"
+	traces, err := NewPrivateDebugAPI(api.e).traceBlock(ctx, block, &TraceConfig{Tracer: &tracer})
+	if err != nil {
+		return blockData, nil
+	}
+
+	for i := 0; i < len(txs) && i < len(traces); i++ {
+		rpcTx, ok := txs[i].(*ethapi.RPCTransaction)
+		if !ok {
+			return nil, fmt.Errorf("unexpected transaction type at index %d", i)
+		}
+		rpcTx.Trace = normalizeCallTracerResult(traces[i])
+	}
+
+	return blockData, nil
+}
+
+func rpcReceiptFromBlock(tx *types.Transaction, receipt *types.Receipt, blockHash common.Hash, blockNumber uint64, index uint64, blockTimestamp uint64) map[string]interface{} {
+	var signer types.Signer = types.FrontierSigner{}
+	if tx.Protected() {
+		signer = types.NewEIP155Signer(tx.ChainId())
+	}
+	from, _ := types.Sender(signer, tx)
+
+	feeScalar := ""
+	if receipt.FeeScalar != nil {
+		feeScalar = receipt.FeeScalar.String()
+	}
+	fields := map[string]interface{}{
+		"blockHash":         blockHash,
+		"blockNumber":       hexutil.Uint64(blockNumber),
+		"transactionHash":   tx.Hash(),
+		"transactionIndex":  hexutil.Uint64(index),
+		"from":              from,
+		"to":                tx.To(),
+		"gasUsed":           hexutil.Uint64(receipt.GasUsed),
+		"cumulativeGasUsed": hexutil.Uint64(receipt.CumulativeGasUsed),
+		"contractAddress":   nil,
+		"logs":              rpcLogsWithTimestamp(receipt.Logs, blockTimestamp),
+		"logsBloom":         receipt.Bloom,
+		"l1GasPrice":        (*hexutil.Big)(receipt.L1GasPrice),
+		"l1GasUsed":         (*hexutil.Big)(receipt.L1GasUsed),
+		"l1Fee":             (*hexutil.Big)(receipt.L1Fee),
+		"l1FeeScalar":       feeScalar,
+		"effectiveGasPrice": (*hexutil.Big)(tx.GasPrice()),
+		"type":              hexutil.Uint64(0),
+	}
+	if len(receipt.PostState) > 0 {
+		fields["root"] = hexutil.Bytes(receipt.PostState)
+	} else {
+		fields["status"] = hexutil.Uint(receipt.Status)
+	}
+	if receipt.Logs == nil {
+		fields["logs"] = []map[string]interface{}{}
+	}
+	if receipt.ContractAddress != (common.Address{}) {
+		fields["contractAddress"] = receipt.ContractAddress
+	}
+	return fields
+}
+
+func normalizeCallTracerResult(txTrace *txTraceResult) map[string]interface{} {
+	envelope := map[string]interface{}{
+		"output":    "0x",
+		"stateDiff": nil,
+		"trace":     []interface{}{},
+		"vmTrace":   nil,
+	}
+	if txTrace == nil {
+		return envelope
+	}
+	if txTrace.Error != "" {
+		envelope["error"] = txTrace.Error
+		return envelope
+	}
+
+	root, ok := asStringMap(txTrace.Result)
+	if !ok {
+		return envelope
+	}
+	if output, ok := stringField(root, "output"); ok && output != "" {
+		envelope["output"] = output
+	}
+
+	flat := make([]interface{}, 0)
+	flattenCallTracerNode(root, []int{}, &flat)
+	envelope["trace"] = flat
+	return envelope
+}
+
+func flattenCallTracerNode(node map[string]interface{}, traceAddress []int, out *[]interface{}) {
+	children := callTraceChildren(node)
+	nodeType, _ := stringField(node, "type")
+	nodeTypeUpper := strings.ToUpper(nodeType)
+
+	entry := map[string]interface{}{
+		"traceAddress": copyTraceAddress(traceAddress),
+		"subtraces":    len(children),
+	}
+
+	switch nodeTypeUpper {
+	case "CALL", "STATICCALL", "DELEGATECALL", "CALLCODE":
+		entry["type"] = "call"
+		entry["action"] = map[string]interface{}{
+			"from":     stringOrDefault(node, "from", "0x"),
+			"callType": strings.ToLower(nodeTypeUpper),
+			"gas":      stringOrDefault(node, "gas", "0x0"),
+			"input":    stringOrDefault(node, "input", "0x"),
+			"to":       stringOrDefault(node, "to", "0x"),
+			"value":    stringOrDefault(node, "value", "0x0"),
+		}
+		entry["result"] = map[string]interface{}{
+			"gasUsed": stringOrDefault(node, "gasUsed", "0x0"),
+			"output":  stringOrDefault(node, "output", "0x"),
+		}
+	case "CREATE", "CREATE2":
+		entry["type"] = "create"
+		entry["action"] = map[string]interface{}{
+			"from":  stringOrDefault(node, "from", "0x"),
+			"gas":   stringOrDefault(node, "gas", "0x0"),
+			"init":  stringOrDefault(node, "input", "0x"),
+			"value": stringOrDefault(node, "value", "0x0"),
+		}
+		result := map[string]interface{}{
+			"gasUsed": stringOrDefault(node, "gasUsed", "0x0"),
+		}
+		if address, ok := stringField(node, "to"); ok && address != "" {
+			result["address"] = address
+		}
+		if code, ok := stringField(node, "output"); ok && code != "" {
+			result["code"] = code
+		}
+		entry["result"] = result
+	default:
+		entry["type"] = strings.ToLower(nodeTypeUpper)
+	}
+
+	if errMsg, ok := stringField(node, "error"); ok && errMsg != "" {
+		entry["error"] = errMsg
+	}
+	*out = append(*out, entry)
+
+	for i, child := range children {
+		nextAddress := append(copyTraceAddress(traceAddress), i)
+		flattenCallTracerNode(child, nextAddress, out)
+	}
+}
+
+func copyTraceAddress(traceAddress []int) []int {
+	copied := make([]int, len(traceAddress))
+	copy(copied, traceAddress)
+	return copied
+}
+
+func callTraceChildren(node map[string]interface{}) []map[string]interface{} {
+	raw, ok := node["calls"]
+	if !ok {
+		return nil
+	}
+	values, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	children := make([]map[string]interface{}, 0, len(values))
+	for _, value := range values {
+		child, ok := asStringMap(value)
+		if !ok {
+			continue
+		}
+		children = append(children, child)
+	}
+	return children
+}
+
+func asStringMap(input interface{}) (map[string]interface{}, bool) {
+	switch m := input.(type) {
+	case map[string]interface{}:
+		return m, true
+	case json.RawMessage:
+		var out map[string]interface{}
+		if err := json.Unmarshal(m, &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	case []byte:
+		var out map[string]interface{}
+		if err := json.Unmarshal(m, &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	case string:
+		var out map[string]interface{}
+		if err := json.Unmarshal([]byte(m), &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	case map[interface{}]interface{}:
+		out := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			ks, ok := k.(string)
+			if !ok {
+				continue
+			}
+			out[ks] = v
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func stringField(fields map[string]interface{}, key string) (string, bool) {
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return "", false
+	}
+	str, ok := value.(string)
+	return str, ok
+}
+
+func stringOrDefault(fields map[string]interface{}, key string, defaultValue string) string {
+	if value, ok := stringField(fields, key); ok && value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func compressedPubKeyFromTx(tx *types.Transaction) (hexutil.Bytes, error) {
+	v, r, s := tx.RawSignatureValues()
+	if isZeroBigInt(v) && isZeroBigInt(r) && isZeroBigInt(s) {
+		return zeroCompressedPubKey(), nil
+	}
+
+	signer := txSigner(tx)
+	from, err := types.Sender(signer, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	recoveryID, err := txRecoveryID(tx, v)
+	if err != nil {
+		return nil, err
+	}
+
+	signature := make([]byte, crypto.SignatureLength)
+	rb := r.Bytes()
+	sb := s.Bytes()
+	copy(signature[32-len(rb):32], rb)
+	copy(signature[64-len(sb):64], sb)
+	signature[64] = recoveryID
+
+	hash := signer.Hash(tx)
+	pubKey, err := crypto.SigToPub(hash[:], signature)
+	if err != nil {
+		return nil, err
+	}
+	if recovered := crypto.PubkeyToAddress(*pubKey); recovered != from {
+		return nil, fmt.Errorf("recovered pubkey does not match tx sender")
+	}
+	return hexutil.Bytes(crypto.CompressPubkey(pubKey)), nil
+}
+
+func txSigner(tx *types.Transaction) types.Signer {
+	if tx.Protected() {
+		return types.NewEIP155Signer(tx.ChainId())
+	}
+	return types.FrontierSigner{}
+}
+
+func txRecoveryID(tx *types.Transaction, v *big.Int) (byte, error) {
+	recovery := new(big.Int).Set(v)
+	if tx.Protected() {
+		chainMul := new(big.Int).Mul(tx.ChainId(), big.NewInt(2))
+		recovery.Sub(recovery, chainMul)
+		recovery.Sub(recovery, big.NewInt(8))
+	}
+	if recovery.BitLen() > 8 {
+		return 0, fmt.Errorf("recovery id too large")
+	}
+	if recovery.Uint64() < 27 {
+		return 0, fmt.Errorf("invalid recovery id")
+	}
+	recID := byte(recovery.Uint64() - 27)
+	if recID > 1 {
+		return 0, fmt.Errorf("invalid recovery id")
+	}
+	return recID, nil
+}
+
+func isZeroBigInt(value *big.Int) bool {
+	return value == nil || value.Sign() == 0
+}
+
+func zeroCompressedPubKey() hexutil.Bytes {
+	return make(hexutil.Bytes, 33)
+}
+
+func rpcLogsWithTimestamp(logs []*types.Log, blockTimestamp uint64) []map[string]interface{} {
+	if logs == nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(logs))
+	for _, log := range logs {
+		out = append(out, map[string]interface{}{
+			"address":          log.Address,
+			"topics":           log.Topics,
+			"data":             hexutil.Bytes(log.Data),
+			"blockNumber":      hexutil.Uint64(log.BlockNumber),
+			"transactionHash":  log.TxHash,
+			"transactionIndex": hexutil.Uint(log.TxIndex),
+			"blockHash":        log.BlockHash,
+			"logIndex":         hexutil.Uint(log.Index),
+			"removed":          log.Removed,
+			"blockTimestamp":   hexutil.Uint64(blockTimestamp),
+		})
+	}
+	return out
 }
 
 // PublicMinerAPI provides an API to control the miner.

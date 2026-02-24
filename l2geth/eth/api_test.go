@@ -18,6 +18,7 @@ package eth
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -26,8 +27,10 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum-optimism/optimism/l2geth/common"
+	"github.com/ethereum-optimism/optimism/l2geth/common/hexutil"
 	"github.com/ethereum-optimism/optimism/l2geth/core/rawdb"
 	"github.com/ethereum-optimism/optimism/l2geth/core/state"
+	"github.com/ethereum-optimism/optimism/l2geth/core/types"
 	"github.com/ethereum-optimism/optimism/l2geth/crypto"
 )
 
@@ -243,5 +246,258 @@ func TestStorageRangeAt(t *testing.T) {
 			t.Fatalf("wrong result for range 0x%x.., limit %d:\ngot %s\nwant %s",
 				test.start, test.limit, dumper.Sdump(result), dumper.Sdump(&test.want))
 		}
+	}
+}
+
+func TestNormalizeCallTracerResultFlattensCalls(t *testing.T) {
+	txTrace := &txTraceResult{
+		Result: map[string]interface{}{
+			"type":    "CALL",
+			"from":    "0x1111",
+			"to":      "0x2222",
+			"gas":     "0x10",
+			"gasUsed": "0x09",
+			"input":   "0xaaaa",
+			"output":  "0xbbbb",
+			"value":   "0x0",
+			"calls": []interface{}{
+				map[string]interface{}{
+					"type":    "STATICCALL",
+					"from":    "0x2222",
+					"to":      "0x3333",
+					"gas":     "0x08",
+					"gasUsed": "0x03",
+					"input":   "0xcccc",
+					"output":  "0xdddd",
+				},
+				map[string]interface{}{
+					"type":    "CREATE",
+					"from":    "0x2222",
+					"to":      "0x4444",
+					"gas":     "0x07",
+					"gasUsed": "0x02",
+					"input":   "0xeeee",
+					"output":  "0xffff",
+					"calls": []interface{}{
+						map[string]interface{}{
+							"type":    "CALL",
+							"from":    "0x4444",
+							"to":      "0x5555",
+							"gas":     "0x04",
+							"gasUsed": "0x01",
+							"input":   "0x12",
+							"output":  "0x34",
+							"value":   "0x1",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	normalized := normalizeCallTracerResult(txTrace)
+	if normalized["output"] != "0xbbbb" {
+		t.Fatalf("unexpected output: %v", normalized["output"])
+	}
+	trace, ok := normalized["trace"].([]interface{})
+	if !ok {
+		t.Fatalf("trace field has wrong type: %T", normalized["trace"])
+	}
+	if len(trace) != 4 {
+		t.Fatalf("unexpected trace length: %d", len(trace))
+	}
+
+	rootEntry := trace[0].(map[string]interface{})
+	if rootEntry["type"] != "call" {
+		t.Fatalf("unexpected root type: %v", rootEntry["type"])
+	}
+	if !reflect.DeepEqual(rootEntry["traceAddress"], []int{}) {
+		t.Fatalf("unexpected root traceAddress: %v", rootEntry["traceAddress"])
+	}
+	rootAction := rootEntry["action"].(map[string]interface{})
+	if rootAction["callType"] != "call" {
+		t.Fatalf("unexpected root callType: %v", rootAction["callType"])
+	}
+	if rootEntry["subtraces"] != 2 {
+		t.Fatalf("unexpected root subtraces: %v", rootEntry["subtraces"])
+	}
+
+	staticEntry := trace[1].(map[string]interface{})
+	if staticEntry["type"] != "call" {
+		t.Fatalf("unexpected static type: %v", staticEntry["type"])
+	}
+	if !reflect.DeepEqual(staticEntry["traceAddress"], []int{0}) {
+		t.Fatalf("unexpected static traceAddress: %v", staticEntry["traceAddress"])
+	}
+	staticAction := staticEntry["action"].(map[string]interface{})
+	if staticAction["callType"] != "staticcall" {
+		t.Fatalf("unexpected static callType: %v", staticAction["callType"])
+	}
+
+	createEntry := trace[2].(map[string]interface{})
+	if createEntry["type"] != "create" {
+		t.Fatalf("unexpected create type: %v", createEntry["type"])
+	}
+	if !reflect.DeepEqual(createEntry["traceAddress"], []int{1}) {
+		t.Fatalf("unexpected create traceAddress: %v", createEntry["traceAddress"])
+	}
+	createAction := createEntry["action"].(map[string]interface{})
+	if createAction["init"] != "0xeeee" {
+		t.Fatalf("unexpected create init: %v", createAction["init"])
+	}
+	if createEntry["subtraces"] != 1 {
+		t.Fatalf("unexpected create subtraces: %v", createEntry["subtraces"])
+	}
+
+	nestedEntry := trace[3].(map[string]interface{})
+	if !reflect.DeepEqual(nestedEntry["traceAddress"], []int{1, 0}) {
+		t.Fatalf("unexpected nested traceAddress: %v", nestedEntry["traceAddress"])
+	}
+}
+
+func TestNormalizeCallTracerResultPropagatesNodeError(t *testing.T) {
+	txTrace := &txTraceResult{
+		Result: map[string]interface{}{
+			"type":    "CALL",
+			"from":    "0x1111",
+			"to":      "0x2222",
+			"gas":     "0x10",
+			"gasUsed": "0x09",
+			"input":   "0xaaaa",
+			"output":  "0xbbbb",
+			"value":   "0x0",
+			"error":   "execution reverted",
+		},
+	}
+
+	normalized := normalizeCallTracerResult(txTrace)
+	trace := normalized["trace"].([]interface{})
+	if len(trace) != 1 {
+		t.Fatalf("unexpected trace length: %d", len(trace))
+	}
+	entry := trace[0].(map[string]interface{})
+	if entry["error"] != "execution reverted" {
+		t.Fatalf("unexpected entry error: %v", entry["error"])
+	}
+}
+
+func TestNormalizeCallTracerResultPropagatesTraceError(t *testing.T) {
+	normalized := normalizeCallTracerResult(&txTraceResult{Error: "tracing failed"})
+	if normalized["error"] != "tracing failed" {
+		t.Fatalf("unexpected trace error: %v", normalized["error"])
+	}
+	trace := normalized["trace"].([]interface{})
+	if len(trace) != 0 {
+		t.Fatalf("expected empty trace, got %d entries", len(trace))
+	}
+}
+
+func TestNormalizeCallTracerResultFromRawJSON(t *testing.T) {
+	raw, err := json.Marshal(map[string]interface{}{
+		"type":    "CALL",
+		"from":    "0x1111",
+		"to":      "0x2222",
+		"gas":     "0x10",
+		"gasUsed": "0x09",
+		"input":   "0xaaaa",
+		"output":  "0xbbbb",
+		"value":   "0x0",
+		"calls": []interface{}{
+			map[string]interface{}{
+				"type":    "DELEGATECALL",
+				"from":    "0x2222",
+				"to":      "0x3333",
+				"gas":     "0x08",
+				"gasUsed": "0x03",
+				"input":   "0xcccc",
+				"output":  "0xdddd",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := normalizeCallTracerResult(&txTraceResult{Result: json.RawMessage(raw)})
+	trace, ok := normalized["trace"].([]interface{})
+	if !ok {
+		t.Fatalf("trace field has wrong type: %T", normalized["trace"])
+	}
+	if len(trace) != 2 {
+		t.Fatalf("unexpected trace length: %d", len(trace))
+	}
+	child := trace[1].(map[string]interface{})
+	action := child["action"].(map[string]interface{})
+	if action["callType"] != "delegatecall" {
+		t.Fatalf("unexpected child callType: %v", action["callType"])
+	}
+}
+
+func TestCompressedPubKeyFromTx(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	to := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	unsignedTx := types.NewTransaction(1, to, big.NewInt(1), 21000, big.NewInt(2), []byte{0x1, 0x2, 0x3})
+	chainID := big.NewInt(10)
+	signedTx, err := types.SignTx(unsignedTx, types.NewEIP155Signer(chainID), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pubKey, err := compressedPubKeyFromTx(signedTx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := crypto.CompressPubkey(&key.PublicKey)
+	if !bytes.Equal(pubKey, expected) {
+		t.Fatalf("unexpected pubkey: got %x want %x", pubKey, expected)
+	}
+}
+
+func TestCompressedPubKeyFromUnsignedTxIsZero(t *testing.T) {
+	to := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	tx := types.NewTransaction(1, to, big.NewInt(1), 21000, big.NewInt(2), []byte{0x1, 0x2, 0x3})
+
+	pubKey, err := compressedPubKeyFromTx(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pubKey) != 33 {
+		t.Fatalf("unexpected pubkey length: %d", len(pubKey))
+	}
+	if !bytes.Equal(pubKey, make([]byte, 33)) {
+		t.Fatalf("expected zero pubkey, got %x", pubKey)
+	}
+}
+
+func TestRPCLogsWithTimestamp(t *testing.T) {
+	logs := []*types.Log{
+		{
+			Address:     common.HexToAddress("0x1000000000000000000000000000000000000001"),
+			Topics:      []common.Hash{common.HexToHash("0x01")},
+			Data:        []byte{0xaa},
+			BlockNumber: 7,
+			TxHash:      common.HexToHash("0x02"),
+			TxIndex:     1,
+			BlockHash:   common.HexToHash("0x03"),
+			Index:       2,
+			Removed:     false,
+		},
+	}
+	out := rpcLogsWithTimestamp(logs, 12345)
+	if len(out) != 1 {
+		t.Fatalf("unexpected logs length: %d", len(out))
+	}
+	if out[0]["blockTimestamp"] != hexutil.Uint64(12345) {
+		t.Fatalf("unexpected blockTimestamp: %v", out[0]["blockTimestamp"])
+	}
+	data, ok := out[0]["data"].(hexutil.Bytes)
+	if !ok {
+		t.Fatalf("unexpected data type: %T", out[0]["data"])
+	}
+	if data.String() != "0xaa" {
+		t.Fatalf("unexpected data: %s", data.String())
 	}
 }

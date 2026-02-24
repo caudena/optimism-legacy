@@ -27,13 +27,12 @@ import (
 	"github.com/ethereum-optimism/optimism/l2geth/log"
 	"github.com/ethereum-optimism/optimism/l2geth/metrics"
 	"github.com/ethereum-optimism/optimism/l2geth/metrics/exp"
-	"github.com/fjl/memsize/memsizeui"
 	colorable "github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
 	"gopkg.in/urfave/cli.v1"
 )
 
-var Memsize memsizeui.Handler
+var Memsize memsizeHandler
 
 var (
 	verbosityFlag = cli.IntFlag{
