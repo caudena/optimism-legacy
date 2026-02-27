@@ -27,6 +27,35 @@ import (
 // all contains all the built in JavaScript tracers by name.
 var all = make(map[string]string)
 
+const oldSelfdestructBlock = `		// If a contract is being self destructed, gather that as a subcall too
+		if (syscall && op == 'SELFDESTRUCT') {
+			var left = this.callstack.length;
+			if (this.callstack[left-1].calls === undefined) {
+				this.callstack[left-1].calls = [];
+			}
+			this.callstack[left-1].calls.push({type: op});
+			return
+		}
+`
+
+const newSelfdestructBlock = `		// If a contract is being self destructed, gather that as a subcall too
+		if (syscall && op == 'SELFDESTRUCT') {
+			var left = this.callstack.length;
+			if (this.callstack[left-1].calls === undefined) {
+				this.callstack[left-1].calls = [];
+			}
+			var address = log.contract.getAddress();
+			var refundAddress = toAddress(log.stack.peek(0).toString(16));
+			this.callstack[left-1].calls.push({
+				type:  op,
+				from:  toHex(address),
+				to:    toHex(refundAddress),
+				value: '0x' + db.getBalance(address).toString(16)
+			});
+			return
+		}
+`
+
 // camel converts a snake cased input string into a camel cased output.
 func camel(str string) string {
 	pieces := strings.Split(str, "_")
@@ -41,6 +70,11 @@ func init() {
 	for _, file := range tracers.AssetNames() {
 		name := camel(strings.TrimSuffix(file, ".js"))
 		all[name] = string(tracers.MustAsset(file))
+	}
+	// Backport SELFDESTRUCT details to the legacy call tracer so consumers can map
+	// parity-style suicide actions without synthetic zero addresses/balances.
+	if code, ok := all["callTracer"]; ok {
+		all["callTracer"] = strings.Replace(code, oldSelfdestructBlock, newSelfdestructBlock, 1)
 	}
 }
 
