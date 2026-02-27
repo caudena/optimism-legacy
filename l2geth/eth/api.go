@@ -251,7 +251,7 @@ func flattenCallTracerNode(node map[string]interface{}, traceAddress []int, out 
 		}
 		result := map[string]interface{}{
 			"gasUsed": stringOrDefault(node, "gasUsed", "0x0"),
-			"address": stringOrDefault(node, "to", "0x"),
+			"address": stringOrDefault(node, "to", common.Address{}.Hex()),
 			"code":    stringOrDefault(node, "output", "0x"),
 		}
 		entry["result"] = result
@@ -268,6 +268,19 @@ func flattenCallTracerNode(node map[string]interface{}, traceAddress []int, out 
 
 	if errMsg, ok := stringField(node, "error"); ok && errMsg != "" {
 		entry["error"] = errMsg
+		switch entry["type"] {
+		case "call":
+			entry["result"] = map[string]interface{}{
+				"gasUsed": "0x0",
+				"output":  "0x",
+			}
+		case "create":
+			entry["result"] = map[string]interface{}{
+				"gasUsed": "0x0",
+				"address": common.Address{}.Hex(),
+				"code":    "0x",
+			}
+		}
 	}
 	*out = append(*out, entry)
 

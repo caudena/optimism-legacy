@@ -379,6 +379,13 @@ func TestNormalizeCallTracerResultPropagatesNodeError(t *testing.T) {
 	if entry["error"] != "execution reverted" {
 		t.Fatalf("unexpected entry error: %v", entry["error"])
 	}
+	result, ok := entry["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected errored entry result map, got: %T", entry["result"])
+	}
+	if result["gasUsed"] != "0x0" || result["output"] != "0x" {
+		t.Fatalf("unexpected errored call result: %v", result)
+	}
 }
 
 func TestNormalizeCallTracerResultPropagatesTraceError(t *testing.T) {
