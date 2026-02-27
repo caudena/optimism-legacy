@@ -259,6 +259,13 @@ func flattenCallTracerNode(node map[string]interface{}, traceAddress []int, out 
 			result["code"] = code
 		}
 		entry["result"] = result
+	case "SELFDESTRUCT", "SUICIDE":
+		entry["type"] = "suicide"
+		entry["action"] = map[string]interface{}{
+			"address":       stringOrDefault(node, "from", "0x"),
+			"refundAddress": stringOrDefault(node, "to", "0x"),
+			"balance":       stringOrDefault(node, "value", "0x0"),
+		}
 	default:
 		entry["type"] = strings.ToLower(nodeTypeUpper)
 	}

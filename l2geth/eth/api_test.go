@@ -432,6 +432,49 @@ func TestNormalizeCallTracerResultFromRawJSON(t *testing.T) {
 	}
 }
 
+func TestNormalizeCallTracerResultMapsSelfdestructToSuicide(t *testing.T) {
+	txTrace := &txTraceResult{
+		Result: map[string]interface{}{
+			"type":    "CALL",
+			"from":    "0x1111",
+			"to":      "0x2222",
+			"gas":     "0x10",
+			"gasUsed": "0x09",
+			"input":   "0xaaaa",
+			"output":  "0xbbbb",
+			"value":   "0x0",
+			"calls": []interface{}{
+				map[string]interface{}{
+					"type":  "SELFDESTRUCT",
+					"from":  "0x2222",
+					"to":    "0x3333",
+					"value": "0x7",
+				},
+			},
+		},
+	}
+
+	normalized := normalizeCallTracerResult(txTrace)
+	trace := normalized["trace"].([]interface{})
+	if len(trace) != 2 {
+		t.Fatalf("unexpected trace length: %d", len(trace))
+	}
+	entry := trace[1].(map[string]interface{})
+	if entry["type"] != "suicide" {
+		t.Fatalf("unexpected type: %v", entry["type"])
+	}
+	action := entry["action"].(map[string]interface{})
+	if action["address"] != "0x2222" {
+		t.Fatalf("unexpected address: %v", action["address"])
+	}
+	if action["refundAddress"] != "0x3333" {
+		t.Fatalf("unexpected refundAddress: %v", action["refundAddress"])
+	}
+	if action["balance"] != "0x7" {
+		t.Fatalf("unexpected balance: %v", action["balance"])
+	}
+}
+
 func TestCompressedPubKeyFromTx(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	if err != nil {
