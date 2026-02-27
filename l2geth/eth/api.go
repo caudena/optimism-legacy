@@ -251,12 +251,8 @@ func flattenCallTracerNode(node map[string]interface{}, traceAddress []int, out 
 		}
 		result := map[string]interface{}{
 			"gasUsed": stringOrDefault(node, "gasUsed", "0x0"),
-		}
-		if address, ok := stringField(node, "to"); ok && address != "" {
-			result["address"] = address
-		}
-		if code, ok := stringField(node, "output"); ok && code != "" {
-			result["code"] = code
+			"address": stringOrDefault(node, "to", "0x"),
+			"code":    stringOrDefault(node, "output", "0x"),
 		}
 		entry["result"] = result
 	case "SELFDESTRUCT", "SUICIDE":
